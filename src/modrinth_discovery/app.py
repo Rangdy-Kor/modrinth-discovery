@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
         self.metadata_label=QLabel(); self.metadata_label.setWordWrap(True); self.status_label=QLabel()
         self.collection_list=QListWidget(); self.collection_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection); self.collection_list.hide()
         self.collection_list.itemDoubleClicked.connect(lambda _item:self.open_selected_library())
+        self.collection_list.itemSelectionChanged.connect(self._update_collection_actions)
         self.collection_actions=QWidget(); collection_buttons=QHBoxLayout(self.collection_actions)
         self.library_filter=QLineEdit(); self.library_filter.setPlaceholderText("제목 또는 slug 검색…")
         self.library_sort=QComboBox(); self.library_sort.addItem("Title","title"); self.library_sort.addItem("First reviewed","first_reviewed_at"); self.library_sort.addItem("Last reviewed","last_reviewed_at")
@@ -80,16 +81,16 @@ class MainWindow(QMainWindow):
         self.open_selected_button.clicked.connect(self.open_selected_library)
         self.to_maybe_button.clicked.connect(lambda:self.change_selected_decision(Decision.MAYBE)); self.to_skipped_button.clicked.connect(lambda:self.change_selected_decision(Decision.SKIPPED)); self.to_reviewed_button.clicked.connect(lambda:self.change_selected_decision(Decision.REVIEWED))
         self.individual_install_button=QPushButton("선택 항목 설치"); self.batch_button=QPushButton("설치 가능한 항목 일괄 설치")
-        self.unreview_button=QPushButton("Reviewed에서 제거")
+        self.library_remove_button=QPushButton("제거")
         self.refresh_button=QPushButton("Refresh")
         self.remove_button=QPushButton("선택한 설치 파일 제거"); self.validate_button=QPushButton("인스턴스 검사")
         self.auto_dependencies=QCheckBox("Automatically install required dependencies")
         self.auto_dependencies.setChecked(self.database.get_bool_setting("auto_dependencies",False)); self.auto_dependencies.toggled.connect(lambda v:self.database.set_bool_setting("auto_dependencies",v))
         self.individual_install_button.clicked.connect(self.install_selected_reviewed); self.batch_button.clicked.connect(self.plan_batch)
-        self.unreview_button.clicked.connect(self.remove_reviewed)
+        self.library_remove_button.clicked.connect(self.remove_selected_library)
         self.refresh_button.clicked.connect(lambda:self.show_reviewed(force=True))
         self.remove_button.clicked.connect(self.remove_installed); self.validate_button.clicked.connect(self.validate_installed)
-        for w in (self.library_filter,self.library_sort,self.open_selected_button,self.to_maybe_button,self.to_skipped_button,self.to_reviewed_button,self.individual_install_button,self.batch_button,self.unreview_button,self.refresh_button,self.remove_button,self.validate_button,self.auto_dependencies): collection_buttons.addWidget(w)
+        for w in (self.library_filter,self.library_sort,self.open_selected_button,self.to_maybe_button,self.to_skipped_button,self.to_reviewed_button,self.library_remove_button,self.individual_install_button,self.batch_button,self.refresh_button,self.remove_button,self.validate_button,self.auto_dependencies): collection_buttons.addWidget(w)
         self.collection_actions.hide()
         layout.addWidget(self.icon_label, alignment=Qt.AlignmentFlag.AlignCenter); layout.addWidget(self.title_label)
         layout.addWidget(self.author_label); layout.addWidget(self.description_label); layout.addWidget(self.metadata_label); layout.addStretch()
@@ -198,8 +199,9 @@ class MainWindow(QMainWindow):
         if self.collection_view and self.library_decision is None:return
         changes=self.history.pop(); self.database.restore_snapshots(changes)
         if self.library_decision is not None:
-            if self.library_decision == Decision.REVIEWED:self.show_reviewed()
-            else:self._reload_library()
+            self._review_generation+=1; self._reload_library()
+            if self.library_decision == Decision.REVIEWED:
+                self.refresh_button.setEnabled(True); self.batch_button.setEnabled(True)
             return
         project,_previous=changes[0]
         if self.current_index and self.projects[self.current_index-1].project_id==project.project_id: self.current_index-=1
@@ -272,12 +274,20 @@ class MainWindow(QMainWindow):
         self.to_maybe_button.setVisible(is_library and decision != Decision.MAYBE)
         self.to_skipped_button.setVisible(is_library and decision != Decision.SKIPPED)
         self.to_reviewed_button.setVisible(is_library and decision != Decision.REVIEWED)
+        self.library_remove_button.setVisible(is_library)
         reviewed=decision == Decision.REVIEWED
         for widget in (self.individual_install_button,self.batch_button,self.refresh_button,self.auto_dependencies):
             widget.setVisible(reviewed)
-        self.unreview_button.hide()
         self.remove_button.setVisible(decision is None)
         self.validate_button.setVisible(decision is None)
+        self._update_collection_actions()
+
+    def _update_collection_actions(self) -> None:
+        has_selection=bool(self.collection_list.selectedItems())
+        for widget in (self.open_selected_button,self.to_maybe_button,self.to_skipped_button,
+                       self.to_reviewed_button,self.library_remove_button,self.remove_button):
+            widget.setEnabled(has_selection)
+        self.individual_install_button.setEnabled(len(self.collection_list.selectedItems()) == 1)
 
     def show_library(self, decision: Decision) -> None:
         if decision == Decision.REVIEWED:
@@ -312,6 +322,7 @@ class MainWindow(QMainWindow):
             item=QListWidgetItem(text); item.setData(Qt.ItemDataRole.UserRole,project)
             self.collection_list.addItem(item)
             if self.library_decision == Decision.REVIEWED:self._review_items[project.project_id]=item
+        self._update_collection_actions()
 
     def open_selected_library(self) -> None:
         selected=self.collection_list.selectedItems()
@@ -326,10 +337,24 @@ class MainWindow(QMainWindow):
         if not project_ids:return
         changes=self.database.change_decisions(project_ids,decision)
         if changes:self.history.append(changes)
-        count=len(changes)
-        if self.library_decision == Decision.REVIEWED:self.show_reviewed()
-        else:self._reload_library()
+        count=len(changes); self._review_generation+=1; self._reload_library()
+        if self.library_decision == Decision.REVIEWED:
+            self.refresh_button.setEnabled(True); self.batch_button.setEnabled(True)
         self.status_label.setText(f"{count}개 항목을 {decision.value.title()}로 이동했습니다.")
+
+    def remove_selected_library(self) -> None:
+        """Forget selected judgments without touching any instance files or inventory."""
+        if self.busy or self.library_decision is None:return
+        projects=[item.data(Qt.ItemDataRole.UserRole) for item in self.collection_list.selectedItems()]
+        project_ids=[project.project_id for project in projects if isinstance(project,Project)]
+        if not project_ids:return
+        changes=self.database.delete_decisions(project_ids)
+        if not changes:return
+        self.history.append(changes); self._review_generation+=1
+        self._reload_library()
+        if self.library_decision == Decision.REVIEWED:
+            self.refresh_button.setEnabled(True); self.batch_button.setEnabled(True)
+        self.status_label.setText(f"{len(changes)}개 항목을 개인 라이브러리에서 제거했습니다. Undo로 복원할 수 있습니다.")
 
     def show_reviewed(self, force: bool=False) -> None:
         instance=self.selected_instance()
@@ -393,12 +418,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self,"항목 선택","설치할 Reviewed 프로젝트 하나를 선택하세요."); return
         project=selected[0].data(Qt.ItemDataRole.UserRole); instance=self.selected_instance()
         if project and instance: self._set_busy(False); self._prepare_reviewed_install(project,instance)
-
-    def remove_reviewed(self) -> None:
-        for item in self.collection_list.selectedItems():
-            project=item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(project,Project): self.database.remove_reviewed(project.project_id)
-        self.show_reviewed()
 
     def _prepare_reviewed_install(self, project: Project, instance: Instance) -> None:
         token=self._set_busy(True,"설치 계획을 확인하는 중…")

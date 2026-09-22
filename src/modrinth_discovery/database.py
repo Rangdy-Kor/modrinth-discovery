@@ -134,6 +134,20 @@ class Database:
                                         [(decision.value,pid) for pid in project_ids])
         return changes
 
+    def delete_decisions(self, project_ids: list[str]) -> list[tuple[Project,DecisionSnapshot]]:
+        """Delete library records atomically and return complete undo snapshots."""
+        if not project_ids:return []
+        unique_ids=list(dict.fromkeys(project_ids)); placeholders=",".join("?" for _ in unique_ids)
+        with self.connection:
+            rows=self.connection.execute(f"""SELECT project_id,slug,title,decision,first_reviewed_at,last_reviewed_at
+                FROM reviewed_projects WHERE project_id IN ({placeholders})""",unique_ids).fetchall()
+            changes=[(Project(row["project_id"],row["slug"],row["title"],"","",0,None,
+                f"https://modrinth.com/mod/{row['slug']}",""),DecisionSnapshot(Decision(row["decision"]),
+                row["first_reviewed_at"],row["last_reviewed_at"])) for row in rows]
+            self.connection.executemany("DELETE FROM reviewed_projects WHERE project_id=?",
+                                        [(project_id,) for project_id in unique_ids])
+        return changes
+
     def projects_by_decision(self, decision: Decision) -> list[Project]:
         return [entry.project for entry in reversed(self.library_entries(decision,"last_reviewed_at"))]
 

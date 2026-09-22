@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 
 from modrinth_discovery.config import AppConfig
 from modrinth_discovery.database import Database
+from modrinth_discovery.feed import filter_unseen
 from modrinth_discovery.library import filter_entries
 from modrinth_discovery.models import Decision, Project
 
@@ -67,6 +68,37 @@ class LibraryRepositoryTests(unittest.TestCase):
         self.assertEqual([e.project.project_id for e in filter_entries(entries,"FABRIC")],["fabric-api"])
         self.assertEqual([e.project.project_id for e in filter_entries(entries,"dium")],["sodium"])
 
+    def test_remove_from_each_library_and_discovery_eligibility(self) -> None:
+        items=[]
+        for decision in (Decision.MAYBE,Decision.SKIPPED,Decision.REVIEWED):
+            item=project(decision.value); items.append(item); self.db.save_decision(item,decision)
+            changes=self.db.delete_decisions([item.project_id])
+            self.assertEqual(len(changes),1); self.assertIsNone(self.db.decision_for(item.project_id))
+            self.assertEqual(filter_unseen([item],self.db.reviewed_ids(),set()),[item])
+        self.assertEqual(sum(len(self.db.library_entries(d)) for d in Decision if d.name != "SKIP"),0)
+
+    def test_batch_remove_disappears_everywhere_and_undo_restores_metadata(self) -> None:
+        first=project("first","First title"); second=project("second","Second title")
+        self._seed(first,Decision.MAYBE,"2000-01-01","2001-01-01")
+        self._seed(second,Decision.SKIPPED,"2010-01-01","2011-01-01")
+        changes=self.db.delete_decisions(["first","second"])
+        self.assertFalse(self.db.reviewed_ids())
+        self.assertTrue(all(not self.db.library_entries(d) for d in (Decision.MAYBE,Decision.SKIPPED,Decision.REVIEWED)))
+        self.db.restore_snapshots(changes)
+        restored={entry.project.project_id:entry for decision in (Decision.MAYBE,Decision.SKIPPED)
+                  for entry in self.db.library_entries(decision)}
+        self.assertEqual((restored["first"].project.slug,restored["first"].project.title,
+                          restored["first"].decision,restored["first"].first_reviewed_at,restored["first"].last_reviewed_at),
+                         ("first","First title",Decision.MAYBE,"2000-01-01","2001-01-01"))
+        self.assertEqual((restored["second"].decision,restored["second"].first_reviewed_at,restored["second"].last_reviewed_at),
+                         (Decision.SKIPPED,"2010-01-01","2011-01-01"))
+
+    def test_reviewed_removal_never_touches_installed_jar(self) -> None:
+        mods=Path(self.tmp.name)/"mods"; mods.mkdir(); jar=mods/"kept.jar"; jar.write_bytes(b"installed")
+        item=project("kept"); self.db.save_decision(item,Decision.REVIEWED)
+        self.db.delete_decisions([item.project_id])
+        self.assertTrue(jar.exists()); self.assertEqual(jar.read_bytes(),b"installed")
+
 
 class LibraryViewTests(unittest.TestCase):
     @classmethod
@@ -98,6 +130,24 @@ class LibraryViewTests(unittest.TestCase):
             self.assertIn("Skipped Project",window.collection_list.item(0).text())
             self.assertEqual(window.workers.active_count,0)
             window.close()
+
+    def test_batch_remove_and_single_undo_are_local(self) -> None:
+        import modrinth_discovery.app as app_module
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app_module,"CONFIG",AppConfig(Path(tmp)/"gui.db")), \
+             patch.object(app_module,"discover_instances",return_value=[]):
+            window=app_module.MainWindow()
+            for value in ("one","two"):window.database.save_decision(project(value),Decision.MAYBE)
+            window.api.get_latest_file=lambda *_args,**_kwargs:self.fail("unexpected network request")  # type: ignore[method-assign]
+            window.show_library(Decision.MAYBE)
+            window.collection_list.selectAll(); window.remove_selected_library()
+            self.assertEqual(window.collection_list.count(),0); self.assertFalse(window.database.reviewed_ids())
+            self.assertEqual(len(window.history[-1]),2)
+            window.undo()
+            self.assertEqual(window.collection_list.count(),2)
+            self.assertEqual(window.database.reviewed_ids(),{"one","two"})
+            self.assertEqual(window.workers.active_count,0); window.close()
 
 
 if __name__ == "__main__": unittest.main()
